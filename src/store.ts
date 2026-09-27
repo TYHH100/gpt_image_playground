@@ -58,10 +58,13 @@ import { orderInputImagesForMask } from './lib/mask'
 import { getChangedParams, normalizeParamsForSettings } from './lib/paramCompatibility'
 import { createTransparentOutputMeta, getTransparentRequestParams, removeKeyedBackgroundFromDataUrl } from './lib/transparentImage'
 import { blobToDataUrl, fileToDataUrl } from './lib/dataUrl'
+import { appFetch, isNativeApp } from './lib/http'
+import { saveBlob } from './lib/downloadImages'
 import { cacheImage, cacheThumbnail, clearImageCaches, deleteCachedImage, deleteImageCacheEntry, ensureImageCached, scheduleThumbnailBackfill } from './lib/imageCache'
 import { hasActiveDataOperations } from './lib/dataOperations'
 import { formatExportFileTime } from './lib/exportFileName'
-import { buildExportZip, createExportBlob, getExportImageEstimatedBytes, getExportZipPlan, MAX_EXPORT_ZIP_BYTES, readExportZip, readExportZipFileAsDataUrl, readExportZipManifest } from './lib/exportZip'
+import { buildExportZip, createExportBlob, getExportImageEstimatedBytes, getExportZipPlan, MAX_EXPORT_ZIP_BYTES, readExportZip, readExportZipFileAsDataUrl, readExportZipManifest, streamExportZip } from './lib/exportZip'
+import { createDownloadsZipSink } from './lib/nativeSave'
 import { deleteAgentRoundFromConversation, getActiveAgentRounds, getAgentRoundPath, normalizeAgentConversations, remapAgentRoundMentionsForPathChange, uniqueIds } from './lib/agentConversationState'
 import { canonicalizeBatchFunctionCallArguments, countResponseToolCalls, createReadyAgentRecoveredToolState, getAgentFunctionOutputCallIds, getAgentRecoveredFailureError, getAgentRecoveredToolCallCount, getPersistableAgentConversations, getPersistableRawResponsePayload, mergeResponseOutputItems, scrubResponseOutputForDeletedAgentTasks, scrubTaskRawResponsePayloadForDeletedTasks } from './lib/agentResponseState'
 import { cleanStaleAgentInputDrafts, clearInputDraftState, isEmptyAgentInputDraft, normalizeAgentInputDrafts, remapAgentInputDraftMentionsForPathChange, restoreAgentInputDraftState, restoreGalleryInputDraftState, saveActiveAgentInputDrafts, saveGalleryInputDraft, syncActiveInputDraft, updateInputDraftImages } from './lib/inputDraftState'
@@ -4314,6 +4317,29 @@ export async function exportData(options: ExportOptions = { exportConfig: true, 
       defaultFavoriteCollectionId,
       agentConversations: options.exportTasks ? getPersistableAgentConversations(agentConversations) : [],
     }
+    if (isNativeApp) {
+      // 低内存设备：流式导出单个 ZIP 到下载目录，内存中只保留当前一张图，不预读图片、不分片
+      const imageIds = options.exportTasks ? await getAllImageIds() : []
+      const sink = await createDownloadsZipSink(`gpt-image-playground-backup_${formatExportFileTime(new Date(exportedAt))}.zip`)
+      try {
+        await streamExportZip(sink, {
+          ...params,
+          imageIds,
+          loadImage: async (id) => {
+            const image = await getImage(id)
+            if (!image) return null
+            const thumbnail = (await getImageThumbnail(id)) ?? undefined
+            return { image, thumbnail }
+          },
+        })
+      } catch (err) {
+        await sink.abort()
+        throw err
+      }
+      useStore.getState().showToast('备份已导出到下载目录', 'success')
+      return
+    }
+
     const imageSizes = []
     for (const id of imageIds) {
       const image = await getImage(id)
@@ -4353,18 +4379,14 @@ export async function exportData(options: ExportOptions = { exportConfig: true, 
         backupPart: plan.length > 1 ? { id: backupId, index: partNumber, total: plan.length } : undefined,
       })
       const blob = createExportBlob(result.bytes)
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
       const suffix = plan.length > 1 ? `_${String(plan.length).padStart(2, '0')}parts_part${String(partNumber).padStart(2, '0')}` : ''
-      a.href = url
-      a.download = `gpt-image-playground-backup_${formatExportFileTime(new Date(exportedAt))}${suffix}.zip`
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      await saveBlob(blob, `gpt-image-playground-backup_${formatExportFileTime(new Date(exportedAt))}${suffix}.zip`)
       if (partNumber < plan.length) await new Promise((resolve) => setTimeout(resolve, 150))
     }
-    useStore.getState().showToast(plan.length > 1 ? `已请求下载 ${plan.length} 个 ZIP，请确认浏览器已允许多文件下载` : '数据已导出', 'success')
+    const message = plan.length > 1
+      ? (isNativeApp ? `已导出 ${plan.length} 个备份文件到下载目录` : `已请求下载 ${plan.length} 个 ZIP，请确认浏览器已允许多文件下载`)
+      : (isNativeApp ? '备份已导出到下载目录' : '数据已导出')
+    useStore.getState().showToast(message, 'success')
   } catch (e) {
     console.error('exportData failed', e)
     const detail = e instanceof Error ? e.message.trim() : String(e).trim()
@@ -4566,7 +4588,7 @@ export async function createInputImageFromFile(file: File): Promise<InputImage |
 
 /** 添加图片到输入（右键菜单）—— 支持 data/blob/http URL */
 export async function addImageFromUrl(src: string): Promise<void> {
-  const res = await fetch(src)
+  const res = await appFetch(src)
   const blob = await res.blob()
   if (!blob.type.startsWith('image/')) throw new Error('不是有效的图片')
   const dataUrl = await blobToDataUrl(blob)

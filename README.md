@@ -412,6 +412,40 @@ npm run build
 
 </details>
 
+<details>
+<summary><strong>📱 方式六：Android 原生应用（Capacitor）</strong></summary>
+
+项目已内置 Capacitor 8 的 Android 工程脚手架，可打包为原生 APK 安装到安卓手机。原生容器内所有 API 请求通过原生网络栈发出（见 `src/lib/http.ts`），**彻底绕开 WebView 的 CORS 跨域限制**，无需再配置 API 代理；图片下载（含下载原图）会直接保存到系统相册的「GPT Image」相册，ZIP 与备份文件直接保存到系统「下载」目录（Android 9 及以下回退为分享面板）。
+
+**1. 准备环境**
+
+- 安装 [Node.js](https://nodejs.org) 与 JDK 21（项目已随包安装 `@capacitor/cli`、`@capacitor/android` 等依赖）。
+- 安装 [Android Studio](https://developer.android.com/studio)（首次启动会自动安装 Android SDK）。
+
+**2. 同步 Web 产物到 Android 工程**
+
+```bash
+npm run cap:sync
+```
+
+该命令会先执行 `npm run build`，再把 `dist/` 复制进 `android/` 工程。
+
+**3. 构建与运行**
+
+- 打开 Android 工程：`npm run cap:open`（等价于在 Android Studio 中打开 `android/` 目录），然后在 Android Studio 中 `Build > Build App(s) / APK` 生成 APK。
+- 或连接手机后直接运行：`npm run cap:run:android`（需要本机配好 Android SDK 环境变量）。
+
+**4. 开发热更新（可选）**
+
+电脑上运行 `npm run dev`，在 `capacitor.config.ts` 中取消 `server.url` 注释并填入电脑的局域网地址（如 `http://192.168.x.x:5173`），重新 `npx cap sync android` 后，App 会直接加载开发服务器，改代码即可实时预览。调试完记得还原。
+
+**注意事项**
+
+- 应用图标目前是 Capacitor 默认图标，可在 Android Studio 中通过 `Image Asset` 工具替换 `android/app/src/main/res` 下的资源。
+- `android/` 为原生工程目录，正常情况下无需手动改动；升级依赖后重新执行 `npx cap sync android` 即可。
+
+</details>
+
 ---
 
 <a id="url-quick-fill"></a>

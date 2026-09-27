@@ -24,6 +24,7 @@ import {
   PROMPT_REWRITE_GUARD_PREFIX,
 } from './imageApiShared'
 import { getImageGenerationModel } from './imageModels'
+import { appFetch, isNativeApp } from './http'
 import { isEventStreamResponse, readJsonServerSentEvents } from './serverSentEvents'
 import { prependCodexCliSizePrompt } from './size'
 
@@ -497,9 +498,10 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): P
 
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), profile.timeout * 1000)
+  let streamImages = Boolean(profile.streamImages)
 
   try {
-    let response: Response
+    let requestInit: RequestInit
 
     if (isEdit) {
       const formData = new FormData()
@@ -527,7 +529,7 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): P
       if (profile.responseFormatB64Json) {
         formData.append('response_format', 'b64_json')
       }
-      if (profile.streamImages) {
+      if (streamImages) {
         formData.append('stream', 'true')
         formData.append('partial_images', String(getStreamPartialImages(profile)))
       }
@@ -560,13 +562,13 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): P
         formData.append('mask', maskBlob, 'mask.png')
       }
 
-      response = await fetch(buildApiUrl(profile.baseUrl, paths.editPath, proxyConfig, useApiProxy), {
+      requestInit = {
         method: 'POST',
         headers: requestHeaders,
         cache: 'no-store',
         body: formData,
         signal: controller.signal,
-      })
+      }
     } else {
       const body: Record<string, unknown> = {
         model: profile.model,
@@ -596,12 +598,12 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): P
       if (profile.responseFormatB64Json) {
         body.response_format = 'b64_json'
       }
-      if (profile.streamImages) {
+      if (streamImages) {
         body.stream = true
         body.partial_images = getStreamPartialImages(profile)
       }
 
-      response = await fetch(buildApiUrl(profile.baseUrl, paths.generationPath, proxyConfig, useApiProxy), {
+      requestInit = {
         method: 'POST',
         headers: {
           ...requestHeaders,
@@ -610,15 +612,35 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): P
         cache: 'no-store',
         body: JSON.stringify(body),
         signal: controller.signal,
-      })
+      }
+    }
+
+    const requestUrl = buildApiUrl(profile.baseUrl, isEdit ? paths.editPath : paths.generationPath, proxyConfig, useApiProxy)
+    let response: Response
+    try {
+      // 流式请求优先走 WebView fetch 保留渐进式输出；原生环境跨域受限时再回退为非流式经原生网络栈绕开 CORS
+      response = streamImages && isNativeApp ? await fetch(requestUrl, requestInit) : await appFetch(requestUrl, requestInit)
+    } catch (err) {
+      if (!isNativeApp || !streamImages || controller.signal.aborted || !(err instanceof TypeError)) throw err
+      streamImages = false
+      if (requestInit.body instanceof FormData) {
+        requestInit.body.delete('stream')
+        requestInit.body.delete('partial_images')
+      } else if (typeof requestInit.body === 'string') {
+        const parsed = JSON.parse(requestInit.body) as Record<string, unknown>
+        parsed.stream = false
+        delete parsed.partial_images
+        requestInit = { ...requestInit, body: JSON.stringify(parsed) }
+      }
+      response = await appFetch(requestUrl, requestInit)
     }
 
     if (!response.ok) {
       const errorMessage = await getApiErrorMessage(response)
-      throw new Error(maybeAppendStreamingHint(errorMessage, response.status, profile.streamImages))
+      throw new Error(maybeAppendStreamingHint(errorMessage, response.status, streamImages))
     }
 
-    if (profile.streamImages && isEventStreamResponse(response)) {
+    if (streamImages && isEventStreamResponse(response)) {
       return parseImagesApiStreamResponse(response, mime, opts.onPartialImage, controller.signal)
     }
 
@@ -824,7 +846,7 @@ async function submitCustomRequest(mapping: CustomProviderSubmitMapping, opts: C
     }
   }
 
-  const response = await fetch(buildApiUrl(profile.baseUrl, path, proxyConfig, useApiProxy), {
+  const response = await appFetch(buildApiUrl(profile.baseUrl, path, proxyConfig, useApiProxy), {
     method,
     headers,
     cache: 'no-store',
@@ -862,7 +884,7 @@ async function pollCustomTaskResult(
     const taskPath = appendQuery(buildTaskPath(poll.path, taskId), poll.query)
     let taskPayload: unknown
     try {
-      const taskResponse = await fetch(buildApiUrl(profile.baseUrl, taskPath, proxyConfig, false), {
+      const taskResponse = await appFetch(buildApiUrl(profile.baseUrl, taskPath, proxyConfig, false), {
         method: poll.method ?? 'GET',
         headers: requestHeaders,
         cache: 'no-store',
@@ -1035,11 +1057,13 @@ async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiPro
       tool_choice: 'required',
     }
     if (profile.reasoningEffort) body.reasoning = { effort: profile.reasoningEffort }
-    if (profile.streamImages) {
+    let streamImages = Boolean(profile.streamImages)
+    if (streamImages) {
       body.stream = true
     }
 
-    const response = await fetch(buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy), {
+    const requestUrl = buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy)
+    const requestInit: RequestInit = {
       method: 'POST',
       headers: {
         ...requestHeaders,
@@ -1048,14 +1072,25 @@ async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiPro
       cache: 'no-store',
       body: JSON.stringify(body),
       signal: controller.signal,
-    })
+    }
+
+    let response: Response
+    try {
+      // 流式请求优先走 WebView fetch 保留渐进式输出；原生环境跨域受限时再回退为非流式经原生网络栈绕开 CORS
+      response = streamImages && isNativeApp ? await fetch(requestUrl, requestInit) : await appFetch(requestUrl, requestInit)
+    } catch (err) {
+      if (!isNativeApp || !streamImages || controller.signal.aborted || !(err instanceof TypeError)) throw err
+      streamImages = false
+      body.stream = false
+      response = await appFetch(requestUrl, { ...requestInit, body: JSON.stringify(body) })
+    }
 
     if (!response.ok) {
       const errorMessage = await getApiErrorMessage(response)
-      throw new Error(maybeAppendStreamingHint(maybeAppendImageToolDroppedHint(errorMessage), response.status, profile.streamImages))
+      throw new Error(maybeAppendStreamingHint(maybeAppendImageToolDroppedHint(errorMessage), response.status, streamImages))
     }
 
-    if (profile.streamImages && isEventStreamResponse(response)) {
+    if (streamImages && isEventStreamResponse(response)) {
       return parseResponsesApiStreamResponse(response, mime, opts.onPartialImage)
     }
 

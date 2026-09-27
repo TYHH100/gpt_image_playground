@@ -134,6 +134,88 @@ export async function buildExportZip(params: BuildExportZipParams) {
   }
 }
 
+export interface ExportZipStreamingSink {
+  addFile(name: string, bytes: Uint8Array, mtime: Date, level?: 0): Promise<void>
+}
+
+export interface StreamingExportParams {
+  options: BuildExportZipOptions
+  exportedAt: number
+  settings: AppSettings
+  tasks: TaskRecord[]
+  imageTasks?: TaskRecord[]
+  favoriteCollections: FavoriteCollection[]
+  defaultFavoriteCollectionId: string | null
+  agentConversations: AgentConversation[]
+  imageIds: string[]
+  loadImage: (id: string) => Promise<{ image: StoredImage; thumbnail?: StoredImageThumbnail } | null>
+}
+
+/**
+ * 与 buildExportZip 相同的备份结构，但图片逐张加载、逐张写入 sink，
+ * 内存中只保留当前一张图，供低内存设备（原生 App）流式导出使用。
+ * 单文件输出，不做分片（内存占用与图片总量无关）。
+ */
+export async function streamExportZip(sink: ExportZipStreamingSink, params: StreamingExportParams): Promise<ExportData> {
+  const imageTasks = params.options.exportTasks ? params.imageTasks ?? params.tasks : []
+  const imageCreatedAtFallback = getImageCreatedAtFallback(imageTasks)
+  const imageFileNameBases = getImageFileNameBases(imageTasks)
+  const imageFiles: ExportData['imageFiles'] = {}
+  const thumbnailFiles: NonNullable<ExportData['thumbnailFiles']> = {}
+  const usedImagePaths = new Set<string>()
+
+  for (const id of params.imageIds) {
+    const loaded = await params.loadImage(id)
+    if (!loaded?.image) continue
+    const img = loaded.image
+    const { ext, bytes } = dataUrlToBytes(img.dataUrl)
+    const path = getUniqueImagePath(imageFileNameBases.get(img.id) || `image-${img.id}`, ext, usedImagePaths)
+    const pathBase = path.slice('images/'.length, -(ext.length + 1))
+    const createdAt = img.createdAt ?? imageCreatedAtFallback.get(img.id) ?? params.exportedAt
+    imageFiles[img.id] = {
+      path,
+      createdAt,
+      source: img.source,
+      width: img.width,
+      height: img.height,
+    }
+    await sink.addFile(path, bytes, new Date(createdAt), 0)
+
+    const thumbnail = loaded.thumbnail
+    if (thumbnail?.thumbnailDataUrl) {
+      const { ext: thumbnailExt, bytes: thumbnailBytes } = dataUrlToBytes(thumbnail.thumbnailDataUrl)
+      const thumbnailPath = `thumbnails/${pathBase}.${thumbnailExt}`
+      imageFiles[img.id].width = imageFiles[img.id].width ?? thumbnail.width
+      imageFiles[img.id].height = imageFiles[img.id].height ?? thumbnail.height
+      thumbnailFiles[img.id] = {
+        path: thumbnailPath,
+        width: thumbnail.width,
+        height: thumbnail.height,
+        thumbnailVersion: thumbnail.thumbnailVersion,
+      }
+      await sink.addFile(thumbnailPath, thumbnailBytes, new Date(createdAt), 0)
+    }
+  }
+
+  const manifest: ExportData = {
+    version: 3,
+    exportedAt: new Date(params.exportedAt).toISOString(),
+  }
+
+  if (params.options.exportConfig) manifest.settings = getExportSettings(params.settings)
+  if (params.options.exportTasks) {
+    if (params.tasks.length) manifest.tasks = params.tasks
+    if (params.agentConversations.length) manifest.agentConversations = params.agentConversations
+    manifest.favoriteCollections = params.favoriteCollections
+    manifest.defaultFavoriteCollectionId = params.defaultFavoriteCollectionId
+    manifest.imageFiles = imageFiles
+    manifest.thumbnailFiles = thumbnailFiles
+  }
+
+  await sink.addFile('manifest.json', strToU8(JSON.stringify(manifest, null, 2)), new Date(params.exportedAt))
+  return manifest
+}
+
 export function getExportZipPlan(
   params: Omit<BuildExportZipParams, 'images' | 'thumbnailsByImageId'>,
   images: ExportImageSize[],

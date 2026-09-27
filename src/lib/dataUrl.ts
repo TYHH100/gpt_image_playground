@@ -6,7 +6,7 @@ const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
   gif: 'image/gif',
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
+export function bytesToBase64(bytes: Uint8Array): string {
   let binary = ''
   for (let i = 0; i < bytes.length; i += 0x8000) {
     binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
@@ -31,6 +31,10 @@ export function bytesToDataUrl(bytes: Uint8Array, filePath: string): string {
 
 export async function blobToDataUrl(blob: Blob, fallbackMime = 'application/octet-stream'): Promise<string> {
   return `data:${blob.type || fallbackMime};base64,${bytesToBase64(new Uint8Array(await blob.arrayBuffer()))}`
+}
+
+export async function blobToBase64(blob: Blob): Promise<string> {
+  return bytesToBase64(new Uint8Array(await blob.arrayBuffer()))
 }
 
 export function fileToDataUrl(file: File): Promise<string> {

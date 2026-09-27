@@ -1,5 +1,6 @@
 import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_STREAM_PARTIAL_IMAGES, type ApiProfile, type AppSettings, type ResponsesApiResponse, type ResponsesOutputItem, type TaskParams } from '../types'
 import { buildApiUrl, readClientDevProxyConfig, shouldUseApiProxy } from './devProxy'
+import { appFetch, isNativeApp } from './http'
 import { appendStreamingFormatHint, getApiErrorMessage, getResponsesImageResultBase64, maybeAppendImageToolDroppedHint, maybeAppendStreamingHint, MIME_MAP, normalizeBase64Image, pickActualParams, PROMPT_REWRITE_GUARD_PREFIX } from './imageApiShared'
 import { getImageGenerationModel } from './imageModels'
 import { normalizeResponsesOutputItems } from './responsesOutputState'
@@ -623,24 +624,37 @@ export async function callAgentResponsesApi(opts: {
       tools: createAgentTools(params, profile, settings, maskDataUrl),
     }
     if (profile.reasoningEffort) body.reasoning = { effort: profile.reasoningEffort }
-    if (profile.streamImages) {
+    let streamImages = Boolean(profile.streamImages)
+    if (streamImages) {
       body.stream = true
     }
 
-    const response = await fetch(buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy), {
+    const requestUrl = buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy)
+    const requestInit: RequestInit = {
       method: 'POST',
       headers: createHeaders(profile),
       cache: 'no-store',
       body: JSON.stringify(body),
       signal: controller.signal,
-    })
+    }
+
+    let response: Response
+    try {
+      // 流式请求优先走 WebView fetch 保留渐进式输出；原生环境跨域受限时再回退为非流式经原生网络栈绕开 CORS
+      response = streamImages && isNativeApp ? await fetch(requestUrl, requestInit) : await appFetch(requestUrl, requestInit)
+    } catch (err) {
+      if (!isNativeApp || !streamImages || controller.signal.aborted || !(err instanceof TypeError)) throw err
+      streamImages = false
+      body.stream = false
+      response = await appFetch(requestUrl, { ...requestInit, body: JSON.stringify(body) })
+    }
 
     if (!response.ok) {
       const errorMessage = await getApiErrorMessage(response)
-      throw new Error(maybeAppendStreamingHint(errorMessage, response.status, profile.streamImages))
+      throw new Error(maybeAppendStreamingHint(errorMessage, response.status, streamImages))
     }
 
-    if (profile.streamImages && isEventStreamResponse(response)) {
+    if (streamImages && isEventStreamResponse(response)) {
       return parseAgentStreamResponse(response, mime, controller.signal, signal, onTextDelta, onOutputItems, onImageToolStarted, onImagePartialImage, onImageToolCompleted, onImageToolFailed)
     }
 
@@ -692,7 +706,7 @@ export async function callAgentConversationTitleApi(opts: {
     }
     if (profile.reasoningEffort) body.reasoning = { effort: profile.reasoningEffort }
 
-    const response = await fetch(buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy), {
+    const response = await appFetch(buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy), {
       method: 'POST',
       headers: createHeaders(profile),
       cache: 'no-store',
@@ -802,25 +816,38 @@ export async function callBatchImageSingle(opts: {
       tool_choice: 'required',
     }
     if (profile.reasoningEffort) body.reasoning = { effort: profile.reasoningEffort }
-    if (profile.streamImages) {
+    let streamImages = Boolean(profile.streamImages)
+    if (streamImages) {
       body.stream = true
     }
 
-    const response = await fetch(buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy), {
+    const requestUrl = buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy)
+    const requestInit: RequestInit = {
       method: 'POST',
       headers: createHeaders(profile),
       cache: 'no-store',
       body: JSON.stringify(body),
       signal: controller.signal,
-    })
+    }
+
+    let response: Response
+    try {
+      // 流式请求优先走 WebView fetch 保留渐进式输出；原生环境跨域受限时再回退为非流式经原生网络栈绕开 CORS
+      response = streamImages && isNativeApp ? await fetch(requestUrl, requestInit) : await appFetch(requestUrl, requestInit)
+    } catch (err) {
+      if (!isNativeApp || !streamImages || controller.signal.aborted || !(err instanceof TypeError)) throw err
+      streamImages = false
+      body.stream = false
+      response = await appFetch(requestUrl, { ...requestInit, body: JSON.stringify(body) })
+    }
 
     if (!response.ok) {
       const errorMsg = await getApiErrorMessage(response)
-      return { batchItemId, image: null, error: maybeAppendStreamingHint(maybeAppendImageToolDroppedHint(errorMsg), response.status, profile.streamImages) }
+      return { batchItemId, image: null, error: maybeAppendStreamingHint(maybeAppendImageToolDroppedHint(errorMsg), response.status, streamImages) }
     }
 
     // Handle streaming
-    if (profile.streamImages && isEventStreamResponse(response)) {
+    if (streamImages && isEventStreamResponse(response)) {
       await onImageToolStarted?.()
       let completedImage: AgentApiResultImage | null = null
       let rawPayload: string | undefined

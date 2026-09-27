@@ -1,5 +1,6 @@
 import type { AppSettings, ResponsesOutputItem, TaskParams } from '../types'
 import { blobToDataUrl } from './dataUrl'
+import { appFetch, isNativeApp } from './http'
 
 export const MIME_MAP: Record<string, string> = {
   png: 'image/png',
@@ -166,12 +167,19 @@ export async function fetchImageUrlAsDataUrl(url: string, fallbackMime: string, 
 
   let response: Response
   try {
-    response = await fetch(url, {
+    response = await appFetch(url, {
       cache: 'no-store',
       signal,
     })
   } catch (err) {
     if (err instanceof TypeError) {
+      // 原生网络栈没有跨域限制，失败只会是网络或链接本身的问题
+      if (isNativeApp) {
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          throw new Error('图片链接下载失败（网络不可用）。')
+        }
+        throw new Error('图片链接下载失败（可能因链接过期或网络异常）。')
+      }
       const probe = await probeNoCorsReachability(url)
       if (probe === 'opaque') {
         throw new Error(`图片已生成，但因服务商未允许跨域，图片链接下载失败。${IMAGE_FETCH_CORS_HINT}`)
